@@ -1,0 +1,166 @@
+---
+- name: Retrieving running services
+  become: yes
+  ansible.builtin.service_facts:
+
+- name: Retrieving node ID from storpool.conf
+  shell: |
+    export PATH=$PATH:/usr/sbin
+    /usr/sbin/storpool_showconf -n -e SP_OURID
+  register: retrieve_id_result
+  changed_when: false
+
+- name: Setting node ID as a fact
+  set_fact:
+    node_id: "{{ retrieve_id_result.stdout }}"
+    cacheable: true
+
+- name: Verifying disk ID offset
+  assert:
+    that:
+      - node_id|int - sp_disk_offset|int > 0
+    fail_msg: 'sp_disk_offest value ({{ sp_disk_offset }}) is too high for host {{ inventory_hostname }} with ID {{ node_id }}'
+  when:
+    - sp_disk_offset is defined
+
+- name: Removing previous disk discovery configuration
+  become: true
+  file:
+    path: '{{ disk_init_helper_discovery_file }}'
+    state: absent
+  when:
+    - sp_discover_disk_run
+
+- name: Stopping multipathd before disk discovery
+  become: yes
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+  loop:
+    - multipathd.service
+    - multipathd.socket
+  when:
+    - sp_discover_disk_run
+    - ansible_facts.services["multipathd.service"] is defined
+
+- name: Discovering suitable disks
+  become: true
+  command: >-
+    {{ disk_init_helper_script }}
+    discover
+    --minimum-sata-size {{ sp_min_disk_size }}
+    --minimum-nvme-size {{ sp_min_nvme_size }}
+    --minimum-pmem-size {{ sp_min_pmem_size }}
+    --maximum-sata-size {{ sp_max_disk_size }}
+    --offsets {{ sp_ssd_disk_id_offset }},{{ sp_nvme_disk_id_offset }},{{ sp_hdd_disk_id_offset }}
+    --start {{ (node_id|int - (sp_diskid_offset|default(0))) * 100 + 1 }}
+    --dump-file {{ disk_init_helper_discovery_file }}
+    {{ sp_discover_disk_pattern if sp_discover_disk_pattern is defined else '' }}
+  when:
+    - sp_discover_disk_run
+  register: disk_discovery
+
+- name: Generate timestamp for saving disk_init_helper runs
+  set_fact:
+    discover_disk_ts: '{{ ansible_date_time.epoch }}'
+  when:
+    - sp_discover_disk_run
+    - sp_backup_disk_init_config
+
+- name: Save disk discovery command with timestamp
+  become: yes
+  copy:
+    content: '{{ disk_discovery.cmd }}'
+    dest: '{{ disk_init_helper_discovery_file | dirname }}/.discover-cmd_{{ discover_disk_ts }}'
+  when:
+    - sp_discover_disk_run
+    - sp_backup_disk_init_config
+
+- name: Save disk discovery JSON dump with timestamp
+  become: yes
+  copy:
+    src: '{{ disk_init_helper_discovery_file }}'
+    remote_src: yes
+    dest: '{{ disk_init_helper_discovery_file | dirname }}/.discover-json_{{ discover_disk_ts }}'
+  when:
+    - sp_discover_disk_run
+    - sp_backup_disk_init_config
+
+- name: Copying disk testing tools
+  copy:
+    src: perform_disktest.sh
+    dest: '{{ ansible_user_dir }}/storpool/'
+    mode: 0755
+
+- name: Reading the disk discover json file
+  become: true
+  slurp:
+    src: '{{ disk_init_helper_discovery_file }}'
+  register: disk_discover_json_b64encoded
+  when:
+    - sp_discover_disk_run
+
+- name: Generating a list of disks to be tested
+  set_fact:
+    disks_to_be_tested: '{{ disk_discover_json_b64encoded["content"] | b64decode | from_json | dict2items | map(attribute="value") | map(attribute="disk") | list }}'
+  when:
+    - sp_test_discovered_disks
+    - sp_discover_disk_run
+
+- name: Testing discovered disks
+  become: true
+  command:
+    argv:
+      - '{{ ansible_user_dir }}/storpool/perform_disktest.sh'
+      - '{{ disks_to_be_tested | join(" ") }}'
+  when:
+    - sp_test_discovered_disks
+    - sp_discover_disk_run
+    - disks_to_be_tested | length >= 1
+
+- name: Setting self-booting disk flag
+  set_fact:
+    self_boot_flag: '{{ sp_new_cluster and inventory_hostname == groups["storpool_server"][0] }}'
+
+- name: Initializing disks
+  become: true
+  command: >-
+    {{ disk_init_helper_script }}
+    init
+    {% if self_boot_flag %}
+    --init
+    {% endif %}
+    --ssd-args "--no-notify {{ sp_ssd_disk_init_args | join(" ") }}"
+    --hdd-args "--no-notify {{ sp_hdd_disk_init_args | join(" ") }}"
+    --exec
+    {{ disk_init_helper_discovery_file }}
+  register: disk_init
+
+- name: Starting multipathd after disk initialization
+  become: yes
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: started
+  loop:
+    - multipathd.socket
+  when:
+    - sp_discover_disk_run
+    - ansible_facts.services["multipathd.service"] is defined
+    - ansible_facts.services["multipathd.service"]["state"] == "running"
+
+- name: Save disk initialization command with timestamp
+  become: yes
+  copy:
+    content: '{{ disk_init.cmd }}'
+    dest: '{{ disk_init_helper_discovery_file | dirname }}/.init-cmd_{{ discover_disk_ts }}'
+  when:
+    - sp_discover_disk_run
+    - sp_backup_disk_init_config
+
+- name: Assigning disks to servers
+  become: true
+  shell: '{{ sp_multi_server_helper }} -i {{ sp_server_instances }} -j | bash'
+  args:
+    executable: /bin/bash
+  when:
+    - (sp_server_instances | int) > 1
